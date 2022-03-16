@@ -16,7 +16,7 @@ local ev = require "event"
 local qqLib = require "qq"
 local pf = require "pf"
 local match = require "pf.match"
-
+local packetgrabberlib = ffi.load("../build/packetgrabber")
 
 local mod = {}
 
@@ -25,6 +25,7 @@ ffi.cdef[[
         uint8_t index;
         void* flow_key;
     };
+    void grab(uint8_t port_id, uint16_t queue_id, struct rte_ring* ring);
 ]]
 
 local flowtracker = {}
@@ -87,16 +88,24 @@ function mod.new(args)
 end
 
 -- Starts a new analyzer
-function flowtracker:startNewAnalyzer(userModule, queue)
+function flowtracker:startNewAnalyzer(userModule, queue, txqueue, threadId, args)
     local p = pipe.newFastPipe()
     table.insert(self.pipes, p) -- Store pipes so the checker can access them
     if ffi.istype("qq_t", queue) then
         log:info("QQ mode")
-        lm.startTask("__FLOWTRACKER_ANALYZER_QQ", self, userModule, queue, p)
+        lm.startTask("__FLOWTRACKER_ANALYZER_QQ", self, userModule, queue, txqueue, p, threadId)
+    elseif ffi.istype("struct rte_ring*", queue) then
+       log:info("rte_ring mode")
+       lm.startTask("__FLOWTRACKER_ANALYZER_RING", self, userModule, queue, txqueue, p, threadId, args)
     else
         log:info("direct mode")
-        lm.startTask("__FLOWTRACKER_ANALYZER", self, userModule, queue, p)
+        lm.startTask("__FLOWTRACKER_ANALYZER", self, userModule, queue, txqueue, p)
     end
+end
+
+function flowtracker:startNewClassifier(userModule, ts_ring, class_rings, num_classes, classless_rings, num_classless)
+   log:info("Starting classifier")
+   lm.startTask("__FLOWTRACKER_CLASSIFIER", self, userModule, ts_ring, class_rings, num_classes, classless_rings, num_classless)
 end
 
 -- Starts the flow expiry checker
@@ -118,8 +127,16 @@ function flowtracker:startNewInserter(rxQueue, qq)
     lm.startTask("__FLOWTRACKER_INSERTER", rxQueue, qq)
 end
 
-function flowtracker:analyzer(userModule, queue, flowPipe)
-    userModule = loadfile(userModule)()
+function flowtracker:startNewPacketGrabber(rxQueue, ring)
+   lm.startTask("__FLOWTRACKER_PACKETGRABBER", rxQueue, ring)
+end
+
+function flowtracker:analyzer(userModule, queue, txqueue, flowPipe)
+   log:info("Starting Analyzer on core %s", lm.getCore())
+   userModule = loadfile(userModule)()
+
+   -- mempool for tx packets
+   local tx_mempool = memory.createMemPool()
 
     -- Cast flow state + default back to correct type
     local stateType = ffi.typeof(userModule.stateType .. "*")
@@ -145,7 +162,8 @@ function flowtracker:analyzer(userModule, queue, flowPipe)
 
     --require("jit.p").start("a")
     while lm.running(self.shutdownDelay) do
-        local rx = queue:tryRecv(bufs, 10)
+       local rx = queue:tryRecv(bufs, 10)
+       local rx_timestamp = lm.getTime()
         for i = 1, rx do
             local buf = bufs[i]
             rxCtr:countPacket(buf)
@@ -173,7 +191,8 @@ function flowtracker:analyzer(userModule, queue, flowPipe)
                     end
                 end
                 -- direct mode has no dumpers, so we can ignore dump requests of the handler
-                handler(flowKey, valuePtr, buf, isNew)
+		buf.timestamp = rx_timestamp * 10^6
+                handler(flowKey, valuePtr, buf, isNew, tx_mempool)
                 accs[index]:release()
             end
         end
@@ -187,8 +206,12 @@ function flowtracker:analyzer(userModule, queue, flowPipe)
     rxCtr:finalize()
 end
 
-function flowtracker:analyzerQQ(userModule, queue, flowPipe)
-    userModule = loadfile(userModule)()
+function flowtracker:analyzerQQ(userModule, queue, flowPipe, threadId)
+   log:info("Starting AnalyzerQQ on core %s", lm.getCore())
+   userModule = loadfile(userModule)()
+
+   -- mempool for tx packets
+   local tx_mempool = memory.createMemPool()
 
     -- Cast flow state + default back to correct type
     local stateType = ffi.typeof(userModule.stateType .. "*")
@@ -210,7 +233,7 @@ function flowtracker:analyzerQQ(userModule, queue, flowPipe)
     local keyBuf = ffi.new("uint8_t[?]", sz)
     log:info("Key buffer size: %i", sz)
 
-    local rxCtr = stats:newPktRxCounter("Analyzer")
+    local rxCtr = stats:newPktRxCounter("Analyzer "..tostring(threadId)) --, "csv", "analyzer.csv")
 
     --require("jit.p").start("a")
     while lm.running(self.shutdownDelay) do
@@ -242,7 +265,7 @@ function flowtracker:analyzerQQ(userModule, queue, flowPipe)
                             flowPipe:send(info)
                         end
                     end
-                    if handler(flowKey, valuePtr, buf, isNew) then
+                    if handler(flowKey, valuePtr, buf, isNew, tx_mempool) then
                         local event = ev.newEvent(buildPacketFilter(flowKey), ev.create)
                         log:debug("[Analyzer]: Handler requested dump of flow %s", flowKey)
                         for _, pipe in ipairs(self.filterPipes) do
@@ -263,7 +286,182 @@ function flowtracker:analyzerQQ(userModule, queue, flowPipe)
     rxCtr:finalize()
 end
 
+function flowtracker:analyzerRing(userModule, queue, txqueue, flowPipe, threadId, args)
+   ffi.cdef[[
+    int my_ring_sc_dequeue(struct rte_ring* r, void** obj_p);
+    unsigned int my_ring_sc_dequeue_bulk(struct rte_ring* r, void** obj_p, unsigned int n, unsigned int* available);
+   ]]
+   log:info("Starting AnalyzerRing on core %s, hardware timestamps: %s", lm.getCore(), args.useHardwareTimestamps)
+   userModule = loadfile(userModule)()
+
+   -- mempool for tx packets
+   local tx_mempool = memory.createMemPool()
+
+    -- Cast flow state + default back to correct type
+    local stateType = ffi.typeof(userModule.stateType .. "*")
+    self.defaultState = ffi.cast(stateType, self.defaultState)
+
+    -- Cache functions
+    local handler = userModule.handlePacket
+    local extractFlowKey = userModule.extractFlowKey
+    local buildPacketFilter = userModule.buildPacketFilter
+
+    -- Allocate hash map accessors
+    local accs = {}
+    for _, v in ipairs(self.maps) do
+        table.insert(accs, v.newAccessor())
+    end
+
+    -- Allocate flow key buffer
+    local sz = hmap.getLargestKeyBufSize(self.maps)
+    local keyBuf = ffi.new("uint8_t[?]", sz)
+    log:info("Key buffer size: %i", sz)
+
+    local rxCtr = stats:newPktRxCounter("Analyzer "..tostring(threadId)) --, "csv", "analyzer.csv")
+
+    -- allocate mbuf pointer
+    --local mbuf = memory.bufArray(1)
+    local mbuf = ffi.cast("void**", ffi.C.malloc(ffi.sizeof("struct rte_mbuf*")))
+    local old_mbuf = ffi.cast("struct rte_mbuf*", ffi.C.malloc(ffi.sizeof("struct rte_mbuf*")))
+
+    --require("jit.p").start("a")
+    local available_ptr = ffi.cast("unsigned int*", ffi.C.malloc(ffi.sizeof("unsigned int")))
+    while lm.running(self.shutdownDelay) do
+       --local ok = pipe.recvFromPacketRing(nil, queue.ring, mbuf, 1)
+       --local ok = C.my_ring_sc_dequeue(queue, mbuf)
+       local ok = C.my_ring_sc_dequeue_bulk(queue, mbuf, 1, available_ptr)
+       if ok > 0 then
+	  if mbuf[0] == old_mbuf then
+	     print("GOT SAME MBUF FROM RING_SC_DEQUEUE")
+	  end
+	  local buf = mbuf[0]
+	  local bufp = ffi.cast("struct rte_mbuf*", buf)
+	  rxCtr:countPacket(bufp)
+	  ffi.fill(keyBuf, sz) -- Clear shared key buffer
+	  local success, index = extractFlowKey(bufp, keyBuf)
+	  if success then
+	     local flowKey = ffi.cast(userModule.flowKeys[index] .. "*", keyBuf) -- Correctly cast alias to the key buffer
+	     local isNew = self.maps[index]:access(accs[index], keyBuf)
+	     local t = accs[index]:get()
+	     local valuePtr = ffi.cast(stateType, t)
+	     if isNew then
+		-- Copy-construct default state
+		ffi.copy(valuePtr, self.defaultState, ffi.sizeof(self.defaultState))
+		
+		-- Copy keyBuf and inform checker about new flow
+		-- if userModule.checkInterval then -- Only bother if there are dumpers
+		--    local t = memory.alloc("void*", sz)
+		--    ffi.fill(t, sz)
+		--    ffi.copy(t, keyBuf, sz)
+		--    local info = memory.alloc("struct new_flow_info*", ffi.sizeof("struct new_flow_info"))
+		--    info.index = index
+		--    info.flow_key = t
+		--    -- we use send here since we know a checker exists and deques/frees our flow keys
+		--    flowPipe:send(info)
+		-- end
+	     end
+	     local available = tonumber(available_ptr[0])
+	     local ringUtilization = available / args.ringSize
+	     -- if analyzer lags behind, drop packets here
+	     --if args.ringSize - available < 5 then
+	     handler(flowKey, valuePtr, bufp, isNew, tx_mempool, txqueue,
+			"ring", args.useHardwareTimestamps, ringUtilization)
+	     --end
+	     -- if handler(flowKey, valuePtr, buf, isNew, "ring") then
+	     -- 	local event = ev.newEvent(buildPacketFilter(flowKey), ev.create)
+	     -- 	log:debug("[Analyzer]: Handler requested dump of flow %s", flowKey)
+	     -- 	for _, pipe in ipairs(self.filterPipes) do
+	     -- 	   pipe:send(event)
+	     -- 	end
+	     -- end
+	     accs[index]:release()
+	  end
+	  old_mbuf = mbuf[0]
+	  rxCtr:update()
+	  bufp:free()
+       end
+    end
+    --require("jit.p").stop()
+    for _, v in ipairs(accs) do
+        v:free()
+    end
+    rxCtr:finalize()   
+end
+
+function flowtracker:classifier(userModule, ts_ring, class_rings, num_classes, classless_rings, num_classless)
+      ffi.cdef[[
+    int my_ring_sc_dequeue(struct rte_ring* r, void** obj_p);
+    int my_ring_sp_enqueue(struct rte_ring* r, void* obj);
+]]
+
+   log:info("Starting Classifier on core %s", lm.getCore())
+   classless_rings = ffi.cast("struct rte_ring**", classless_rings)
+   class_rings = ffi.cast("struct rte_ring**", class_rings)
+   -- local myclassless_rings = {}
+   -- for i = 0, num_classless - 1 do
+   --    table.insert(myclassless_rings, pipe.pktsizedRing.newPktsizedRingFromRing(classless_rings[i]))
+   -- end
+ --there are %s class_rings and %s classless_rings", lm.getCore(), #class_rings, #classless_rings)
+   userModule = loadfile(userModule)()
+
+    -- Allocate flow key buffer
+    local sz = hmap.getLargestKeyBufSize(self.maps)
+    local keyBuf = ffi.new("uint8_t[?]", sz)
+    log:info("Key buffer size: %i", sz)
+
+    local classifierCtr = stats:newPktRxCounter("Classifier") --, "csv", "analyzer.csv")
+
+    -- allocate mbuf pointer
+    local mbuf = ffi.cast("void**", ffi.C.malloc(ffi.sizeof("struct rte_mbuf**")))
+
+    --require("jit.p").start("a")
+    while lm.running(self.shutdownDelay) do
+       local ok = C.my_ring_sc_dequeue(ts_ring, mbuf)
+       if ok == 0 then
+	  local buf = mbuf[0]
+	  local bufp = ffi.cast("struct rte_mbuf*", buf)
+	  classifierCtr:countPacket(bufp)
+	  ffi.fill(keyBuf, sz) -- Clear shared key buffer
+	  local success, index = userModule.extractFlowKey(bufp, keyBuf)
+	  if success then
+	     local flowKey = ffi.cast(userModule.flowKeys[index] .. "*", keyBuf) -- Correctly cast alias to the key buffer
+	     local class = userModule.classify(flowKey)
+	     if class == 0 then
+		-- "hash" flowKey
+		local hash = 0
+		local to_hash = tostring(flowKey)
+		for i = 1, #to_hash do
+		   hash = hash + string.byte(to_hash, i, i)
+		end
+		local dest_ring = (hash % num_classless)
+		-- insert into classless rings
+		if C.my_ring_sp_enqueue(classless_rings[dest_ring], bufp) ~= 0 then
+		   log:warn("Packet dropped, classless_ring %s seems to be occupied", dest_ring)
+		end
+	     elseif class > 0 then
+		if class > num_classes then
+		   log:warn("Class is to high, assuming highest class")
+		   class = num_classes
+		end
+		if C.my_ring_sp_enqueue(class_rings[class - 1], bufp) ~= 0 then
+		   log:warn("Packet dropped, class_ring %s seems to be occupied", class - 1)
+		end
+	     else
+		-- ignore pkt
+		log:warn("class was %s, ignoring", class)
+	     end
+	  end
+	  classifierCtr:update()
+
+       end
+    end
+    --require("jit.p").stop()
+    classifierCtr:finalize()
+end
+
+
 function flowtracker:checker(userModule)
+   log:info("Starting Checker on core %s", lm.getCore())
     userModule = loadfile(userModule)()
     if not userModule.checkInterval then
         log:info("[Checker]: Disabled by user module")
@@ -347,6 +545,7 @@ function flowtracker:checker(userModule)
 end
 
 function flowtracker:dumper(id, qq, path, filterPipe)
+   log:info("Starting Dumper on core %s", lm.getCore())
     pcap:setInitialFilesize(2^19) -- 0.5 MiB
     local ruleSet = {} -- Used to maintain the filter strings and pcap handles
     local handlers = {} -- Holds handle functions for the matcher
@@ -359,7 +558,7 @@ function flowtracker:dumper(id, qq, path, filterPipe)
 
     log:setLevel("INFO")
 
-    require("jit.p").start("a")
+    --require("jit.p").start("a")
     local handleEvent = function(event)
         if event == nil then
             return
@@ -433,7 +632,7 @@ function flowtracker:dumper(id, qq, path, filterPipe)
         end
         rxCtr:update(0, 0)
     end
-    require("jit.p").stop()
+    --require("jit.p").stop()
     rxCtr:finalize()
     for _, rule in pairs(ruleSet) do
         rule.pcap:close()
@@ -442,8 +641,15 @@ function flowtracker:dumper(id, qq, path, filterPipe)
 end
 
 function flowtracker.inserter(rxQueue, qq)
+   log:info("Starting QQ Inserter on core %s", lm.getCore())
     qq:inserterLoop(rxQueue)
     log:info("[Inserter]: Shutdown")
+end
+
+function flowtracker.packetGrabber(rxQueue, ring)
+   log:info("Starting PacketGrabber for IF %s and queue %s on core %s", rxQueue.id, rxQueue.qid, lm.getCore())
+   packetgrabberlib.grab(rxQueue.id, rxQueue.qid, ring)
+   log:info("[PacketGrabber]: Shutdown")
 end
 
 function flowtracker:delete()
@@ -471,6 +677,9 @@ mod.analyzerTask = "__FLOWTRACKER_ANALYZER"
 __FLOWTRACKER_ANALYZER_QQ = flowtracker.analyzerQQ
 mod.analyzerQQTask = "__FLOWTRACKER_ANALYZER_QQ"
 
+__FLOWTRACKER_ANALYZER_RING = flowtracker.analyzerRing
+mod.analyzerRingTask = "__FLOWTRACKER_ANALYZER_RING"
+
 __FLOWTRACKER_CHECKER = flowtracker.checker
 mod.checkerTask = "__FLOWTRACKER_CHECKER"
 
@@ -480,6 +689,12 @@ mod.dumperTask = "__FLOWTRACKER_DUMPER"
 __FLOWTRACKER_INSERTER = flowtracker.inserter
 mod.inserterTask = "__FLOWTRACKER_INSERTER"
 
+__FLOWTRACKER_PACKETGRABBER = flowtracker.packetGrabber
+mod.inserterTask = "__FLOWTRACKER_PACKETGRABBER"
+
+
+__FLOWTRACKER_CLASSIFIER = flowtracker.classifier
+mod.classifierTask = "__FLOWTRACKER_CLASSIFIER"
 -- don't forget the usual magic in __serialize for thread-stuff
 
 return mod

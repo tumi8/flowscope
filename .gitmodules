@@ -1,8 +1,7 @@
 [submodule "libmoon"]
-	path = libmoon
-	url = https://github.com/libmoon/libmoon
-	shallow = true
+    path = libmoon
+    url = https://github.com/tumi8/libmoon.git
+    branch = holzingk/noms22
 [submodule "tbb"]
 	path = tbb
 	url = https://github.com/01org/tbb.git
-	shallow = true

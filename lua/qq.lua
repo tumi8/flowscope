@@ -154,7 +154,7 @@ local band, rshift, lshift = bit.band, bit.rshift, bit.lshift
 
 function packetHeader:getTimestamp()
 	-- timestamp relative to libmoon.getTime(), i.e. the TSC in seconds
-	return tonumber(band(self.ts_vlan, 0xffffffffffffULL)) / 10^6
+	return tonumber(band(self.ts_vlan, 0xffffffffffffULL)) -- / 10^6
 end
 
 function packetHeader:getVlan()
